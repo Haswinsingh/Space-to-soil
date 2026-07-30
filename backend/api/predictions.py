@@ -12,8 +12,9 @@ import json
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import pickle
 from io import BytesIO
-from PIL import Image
+from PIL import Image as PILImage
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -25,11 +26,62 @@ from backend.utils import config
 from backend.utils.database import get_collection
 from backend.utils.mongo import serialize_document, make_response
 from backend.reports.generator import generate_crop_report
-from backend.datasets.loader import detect_dataset_type, load_image_dataset
 from backend.preprocessing.pipeline import run_preprocessing_pipeline
+from backend.config.datasets import DATASETS
+
+router = APIRouter(prefix="/predictions", tags=["Predictions & Benchmarks"])
+logger = logging.getLogger("PredictionsAPI")
+
+# Heuristics image detection helper
+def detect_uploaded_image_type(filename: str, width: int, height: int, num_channels: int = 3) -> str:
+    fn_lower = filename.lower()
+    
+    # 1. Folder paths or explicit keywords in filename
+    if "eurosat" in fn_lower:
+        return "EuroSAT"
+    if "plantvillage" in fn_lower or "plant_village" in fn_lower or "leaf" in fn_lower or "disease" in fn_lower:
+        return "PlantVillage"
+    if "sentinel" in fn_lower or "sentinel2" in fn_lower or "s2" in fn_lower:
+        return "Sentinel2"
+        
+    # 2. Disease symptoms keywords (PlantVillage indicators)
+    pv_keywords = ["pepper", "potato", "tomato", "healthy", "spot", "blight", "mold", "rust", "scab", "virus", "curl", "mosaic"]
+    if any(kw in fn_lower for kw in pv_keywords):
+        return "PlantVillage"
+        
+    # 3. Agricultural classes keywords (Sentinel2 / EuroSAT indicators)
+    ag_keywords = ["annualcrop", "forest", "herbaceousvegetation", "highway", "industrial", "pasture", "permanentcrop", "residential", "river", "sealake"]
+    if any(kw in fn_lower for kw in ag_keywords):
+        return "Sentinel2"
+        
+    # 4. Dimension heuristic: EuroSAT images are exactly 64x64
+    if width == 64 and height == 64:
+        return "EuroSAT"
+        
+    # 5. File format heuristic: GeoTIFFs are standard Sentinel2 imagery
+    if fn_lower.endswith(('.tif', '.tiff', '.geotiff')):
+        return "Sentinel2"
+        
+    # Default fallback
+    return "Sentinel2"
+
+def check_dataset_models_exist(base_dir, dataset_name):
+    d_low = dataset_name.lower()
+    class_dir = os.path.join(base_dir, "models", "classical", d_low)
+    quant_dir = os.path.join(base_dir, "models", "quantum", d_low)
+    
+    cnn_exist = os.path.exists(os.path.join(class_dir, "cnn.pth")) or os.path.exists(os.path.join(class_dir, "cnn_model.pth"))
+    rf_exist = os.path.exists(os.path.join(class_dir, "rf.pkl")) or os.path.exists(os.path.join(class_dir, "random_forest.pkl")) or os.path.exists(os.path.join(class_dir, "random_forest_model.pkl"))
+    svm_exist = os.path.exists(os.path.join(class_dir, "svm.pkl")) or os.path.exists(os.path.join(class_dir, "svm_model.pkl"))
+    xgb_exist = os.path.exists(os.path.join(class_dir, "xgb.pkl")) or os.path.exists(os.path.join(class_dir, "xgboost.pkl")) or os.path.exists(os.path.join(class_dir, "xgboost_model.pkl"))
+    
+    qsvm_exist = os.path.exists(os.path.join(quant_dir, "qsvm.pkl")) or os.path.exists(os.path.join(quant_dir, "qsvm_model.pkl"))
+    vqc_exist = os.path.exists(os.path.join(quant_dir, "vqc.pkl"))
+    hqcnn_exist = os.path.exists(os.path.join(quant_dir, "hybrid_qcnn.pth"))
+    
+    return all([cnn_exist, rf_exist, svm_exist, xgb_exist, qsvm_exist, vqc_exist, hqcnn_exist])
 
 def generate_gradcam(model, img_tensor, target_class, original_pil_image):
-    # We hook onto conv2 layer of SimpleCNN
     feature_maps = []
     gradients = []
     
@@ -42,47 +94,38 @@ def generate_gradcam(model, img_tensor, target_class, original_pil_image):
     h1 = model.conv2.register_forward_hook(hook_fn)
     h2 = model.conv2.register_backward_hook(hook_grad_fn)
     
-    # Forward pass
     output = model(img_tensor)
-    
-    # Backward pass
     score = output[0, target_class]
     model.zero_grad()
     score.backward()
     
-    # Remove hooks
     h1.remove()
     h2.remove()
     
     if len(feature_maps) == 0 or len(gradients) == 0:
         return None
         
-    f_map = feature_maps[0].detach().numpy()[0] # (32, 16, 16)
-    grads = gradients[0].detach().numpy()[0]    # (32, 16, 16)
+    f_map = feature_maps[0].detach().numpy()[0]
+    grads = gradients[0].detach().numpy()[0]
     
-    # Channel weights: mean gradient over the spatial dimensions
     weights = np.mean(grads, axis=(1, 2))
     
-    # Weighted combination of feature maps
     cam = np.zeros(f_map.shape[1:], dtype=np.float32)
     for i, w in enumerate(weights):
         cam += w * f_map[i]
         
-    cam = np.maximum(cam, 0) # ReLU
+    cam = np.maximum(cam, 0)
     if cam.max() > 0:
         cam = cam / cam.max()
         
-    # Resize to match (64, 64)
-    cam_pil = Image.fromarray((cam * 255).astype(np.uint8)).resize((64, 64), Image.BILINEAR)
+    cam_pil = PILImage.fromarray((cam * 255).astype(np.uint8)).resize((64, 64), PILImage.BILINEAR)
     cam_resized = np.array(cam_pil) / 255.0
     
-    # Convert to heatmap colormap
     cm = plt.get_cmap('jet')
-    colored = cm(cam_resized)[:, :, :3] # Remove alpha channel
+    colored = cm(cam_resized)[:, :, :3]
     heatmap = (colored * 255).astype(np.uint8)
     
-    # Blend with original image resized to 64x64
-    orig_np = np.array(original_pil_image.resize((64, 64), Image.BILINEAR).convert("RGB"))
+    orig_np = np.array(original_pil_image.resize((64, 64), PILImage.BILINEAR).convert("RGB"))
     blended = (orig_np * 0.5 + heatmap * 0.5).astype(np.uint8)
     
     return blended
@@ -169,12 +212,13 @@ def save_benchmark_plots_and_reports(summary_data, reports_dir):
         plt.close()
         
     # 6. Save Benchmark Report text summary
+    dataset_name = summary_data.get('dataset_name', 'EuroSAT')
     report_path = os.path.join(reports_dir, "benchmark_report.txt")
     with open(report_path, "w") as f:
         f.write("QuantumCrop AI – Benchmark Report\n")
         f.write("=================================\n")
         f.write(f"Generated at: {datetime.datetime.now().isoformat()}\n\n")
-        f.write(f"Dataset: EuroSAT (Dataset Size: {summary_data.get('dataset_size', 0)}, Classes: {summary_data.get('class_count', 0)})\n\n")
+        f.write(f"Dataset: {dataset_name} (Dataset Size: {summary_data.get('dataset_size', 0)}, Classes: {summary_data.get('class_count', 0)})\n\n")
         f.write("Model Performance Summary:\n")
         f.write("--------------------------\n")
         
@@ -192,20 +236,15 @@ def save_benchmark_plots_and_reports(summary_data, reports_dir):
             f.write(f"    F1 Score: {clf_data.get('f1_score', 0)*100:.2f}%\n")
             f.write(f"    Training Time: {clf_data.get('training_time_s', 0):.3f}s\n")
 
-router = APIRouter(prefix="/predictions", tags=["Predictions & Benchmarks"])
-logger = logging.getLogger("PredictionsAPI")
-
 @router.post("/predict")
 async def run_predictions(
     file: UploadFile = File(None),
     current_user: dict = Depends(get_current_user)
 ):
-    # 1. Validation: if file parameter is missing or has empty filename, raise HTTPException 400
     if not file or not file.filename:
         raise HTTPException(status_code=400, detail="Uploaded file is missing. Please select a file to upload.")
 
     try:
-        # 2. Print debugging information
         print("[DEBUG] Prediction started")
         print(f"[DEBUG] Received filename: {file.filename}")
         print(f"[DEBUG] Received content type: {file.content_type}")
@@ -220,22 +259,19 @@ async def run_predictions(
         file_size_kb = round(file_size_bytes / 1024, 2)
         print(f"[DEBUG] File size: {file_size_bytes} bytes ({file_size_kb} KB)")
 
-        # Validate allowed formats (jpg, jpeg, png, jfif, tif, tiff, geotiff)
         allowed_exts = {".png", ".jpg", ".jpeg", ".jfif", ".tif", ".tiff", ".geotiff"}
         _, ext = os.path.splitext(file.filename.lower())
         if ext not in allowed_exts:
             return make_response(success=False, message=f"Unsupported file format {ext}. Allowed formats: PNG, JPG, JPEG, JFIF, TIF, TIFF, GeoTIFF.")
 
-        # Open PIL Image to get dimensions
         try:
-            img = Image.open(BytesIO(contents))
+            img = PILImage.open(BytesIO(contents))
             width, height = img.size
             print(f"[DEBUG] Image dimensions: {width}x{height}")
         except Exception as img_err:
             print(f"[DEBUG] Failed to open image: {img_err}")
             return make_response(success=False, message="Invalid or corrupt image file.")
 
-        # 3. Save uploaded image to backend/uploads/
         file_id = str(uuid.uuid4())
         raw_filename = f"raw_{file_id}{ext}"
         uploads_dir = os.path.join(config.BASE_DIR, "uploads")
@@ -249,7 +285,6 @@ async def run_predictions(
             logger.exception(save_err)
             return make_response(success=False, message=f"Failed to save uploaded image: {str(save_err)}")
 
-        # Convert to standard web-compatible format (PNG) if needed
         web_filename = f"raw_{file_id}.png" if ext in [".tif", ".tiff", ".geotiff", ".jfif"] else raw_filename
         web_raw_path = os.path.join(uploads_dir, f"raw_{file_id}.png") if ext in [".tif", ".tiff", ".geotiff", ".jfif"] else raw_path
 
@@ -260,7 +295,6 @@ async def run_predictions(
                 print(f"[DEBUG] Conversion to PNG failed: {conv_err}")
                 shutil.copyfile(raw_path, web_raw_path)
 
-        # 4. Save processed outputs into backend/uploads/processed/
         processed_dir = os.path.join(uploads_dir, "processed")
         os.makedirs(processed_dir, exist_ok=True)
 
@@ -272,7 +306,6 @@ async def run_predictions(
 
         features = pipeline_results["features"]
 
-        # Build web processed paths dictionary with prefix
         web_processed_paths = {}
         for name in ["rgb", "red", "green", "blue", "nir", "ndvi", "evi", "savi", "ndwi", "ci"]:
             if name == "rgb":
@@ -284,21 +317,24 @@ async def run_predictions(
                 
             web_processed_paths[name] = f"/uploads/processed/{filename_mapped}"
 
-        # 5. Check if models are trained
-        cnn_path = os.path.join(config.BASE_DIR, "models", "classical", "cnn_model.pth")
-        if not os.path.exists(cnn_path):
-            return make_response(success=False, message="Models have not been trained yet. Please complete training in the Benchmark tab first.")
+        # STEP 7: Detect image type automatically
+        detected_dataset = detect_uploaded_image_type(file.filename, width, height, 4 if ext in [".tif", ".tiff", ".geotiff"] else len(img.getbands()))
+        print(f"[IMAGE ROUTING] Image routed to dataset: {detected_dataset}")
 
-        # 6. Run Classical & Quantum predictions
+        # Check if models are trained for the routed dataset
+        if not check_dataset_models_exist(config.BASE_DIR, detected_dataset):
+            return make_response(success=False, message=f"Models have not been trained yet for {detected_dataset}. Please complete training in the Benchmark tab first.")
+
+        # Run Classical & Quantum predictions on routed dataset
         try:
-            classical = ClassicalPipeline(config.BASE_DIR)
+            classical = ClassicalPipeline(config.BASE_DIR, dataset_name=detected_dataset)
             classical_res = classical.predict(features, image_path=raw_path)
         except Exception as clf_err:
             logger.exception(clf_err)
             return make_response(success=False, message=f"Classical prediction model error: {str(clf_err)}")
 
         try:
-            quantum = QuantumPipeline(config.BASE_DIR)
+            quantum = QuantumPipeline(config.BASE_DIR, dataset_name=detected_dataset)
             quantum_res = quantum.predict(features, image_path=raw_path)
         except Exception as q_err:
             logger.exception(q_err)
@@ -308,7 +344,6 @@ async def run_predictions(
         confidence = classical_res["health_predictions"]["svm"]["confidence"]
         predicted_yield = classical_res["yield_t_ha"]
         quantum_class = quantum_res.get("qsvm", {}).get("class_name", "")
-        quantum_confidence = quantum_res.get("qsvm", {}).get("confidence", 1.0)
         
         svm_probs = classical_res["health_predictions"]["svm"].get("probabilities", [])
         disease_prob = svm_probs[3] if len(svm_probs) > 3 else 0.0
@@ -319,10 +354,9 @@ async def run_predictions(
         ndwi_mean = features.get("ndwi_mean", 0.0)
         ci_mean = features.get("ci_mean", 3.0)
 
-        # 7. Generate recommendations
+        # Generate recommendations
         recommendations = []
 
-        # Rule 1: NDVI Vegetation Density
         if ndvi_mean > 0.7:
             recommendations.append({
                 "severity": "low",
@@ -342,7 +376,6 @@ async def run_predictions(
                 "message": "Warning: Very low vegetation density. Indicates potential crop stress or sparse growth."
             })
 
-        # Rule 2: Chlorophyll / Nitrogen Deficiency
         if ci_mean < 1.5:
             recommendations.append({
                 "severity": "high",
@@ -356,7 +389,6 @@ async def run_predictions(
                 "message": "Chlorophyll levels are slightly depressed. Consider early nitrogen fertilizer application."
             })
 
-        # Rule 3: NDWI / Irrigation
         if ndwi_mean < -0.2:
             recommendations.append({
                 "severity": "high",
@@ -370,7 +402,6 @@ async def run_predictions(
                 "message": "Moderate moisture stress detected. Ensure regular watering schedules are maintained."
             })
 
-        # Rule 4: Disease
         if disease_prob > 0.6:
             recommendations.append({
                 "severity": "high",
@@ -384,7 +415,6 @@ async def run_predictions(
                 "message": "Elevated disease probability. Inspect patchy vegetation sections for early pathogen indicators."
             })
 
-        # Rule 5: Yield Improvement
         if predicted_yield < 6.0:
             recommendations.append({
                 "severity": "high",
@@ -392,7 +422,6 @@ async def run_predictions(
                 "message": "Yield forecast is below target threshold. Apply soil conditioners and optimize macronutrients."
             })
 
-        # Rule 6: Confidence
         if confidence < 0.6:
             recommendations.append({
                 "severity": "medium",
@@ -400,16 +429,14 @@ async def run_predictions(
                 "message": "Prediction confidence is low. Recommend collecting more high-resolution drone imagery."
             })
 
-        # Rule 7: Model Disagreement
         is_quantum_veg = quantum_class in ["AnnualCrop", "Forest", "HerbaceousVegetation", "PermanentCrop", "Pasture"]
-        if not is_quantum_veg:
+        if not is_quantum_veg and quantum_class != "":
             recommendations.append({
                 "severity": "medium",
                 "title": "Model Disagreement",
                 "message": f"Quantum model classifies area as {quantum_class} while Classical model predicts crop health state {health_status}. Recommend manual land use inspection."
             })
 
-        # Rule 8: If no alerts or recommendations, add default optimal health
         if not recommendations:
             recommendations.append({
                 "severity": "low",
@@ -417,7 +444,6 @@ async def run_predictions(
                 "message": "Crop shows high vegetation reflection and moisture. Maintain current irrigation and fertilizer schedules."
             })
 
-        # Task 7: Add logging
         print("\n=== AI RECOMMENDATION ENGINE LOGGING ===")
         print(f"NDVI Mean: {ndvi_mean:.4f}")
         print(f"EVI Mean: {evi_mean:.4f}")
@@ -437,7 +463,6 @@ async def run_predictions(
             "quantum_details": quantum_res
         }
 
-        # Save to MongoDB uploads_history collection
         history_col = get_collection("uploads_history")
         history_item = {
             "file_id": file_id,
@@ -462,17 +487,16 @@ async def run_predictions(
 
         print("[DEBUG] Prediction finished")
 
-        # Return unified response payload matching the required schema + backward-compatible keys
         response_data = {
             "success": True,
             "processed": datetime.datetime.utcnow().isoformat(),
             "prediction": health_status,
-            "crop_health": health_status, # compat
+            "crop_health": health_status,
             "confidence": confidence,
             "indices": features,
-            "features": features, # compat
+            "features": features,
             "recommendation": " ".join([rec["message"] for rec in recommendations]) if recommendations and isinstance(recommendations[0], dict) else " ".join(recommendations),
-            "recommendations": recommendations, # compat
+            "recommendations": recommendations,
             "original_image": f"/uploads/{web_filename}",
             "processed_image": f"/uploads/processed/{file_id}_index_ndvi.png",
             "file_id": file_id,
@@ -492,10 +516,7 @@ async def run_predictions(
         return make_response(success=False, message=str(e))
 
 def get_base64_examples(dataset, cnn_model, hqcnn_model, num_examples=6):
-    import torch
-    import torch.nn.functional as F
     examples = []
-    
     indices = np.random.choice(len(dataset), size=min(len(dataset), num_examples), replace=False)
     classes = dataset.classes
     
@@ -506,13 +527,11 @@ def get_base64_examples(dataset, cnn_model, hqcnn_model, num_examples=6):
     for idx in indices:
         img_tensor, label = dataset[idx]
         
-        # Predict using CNN
         with torch.no_grad():
             cnn_out = cnn_model(img_tensor.unsqueeze(0))
             _, cnn_pred = cnn_out.max(1)
             cnn_class = classes[cnn_pred.item()]
             
-            # Predict using Hybrid QCNN (if available)
             if hqcnn_model:
                 try:
                     q_out = hqcnn_model(img_tensor.unsqueeze(0))
@@ -523,7 +542,6 @@ def get_base64_examples(dataset, cnn_model, hqcnn_model, num_examples=6):
             else:
                 q_class = cnn_class
                 
-        # Reverse normalization (mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         mean = np.array([0.485, 0.456, 0.406])
         std = np.array([0.229, 0.224, 0.225])
         
@@ -531,7 +549,7 @@ def get_base64_examples(dataset, cnn_model, hqcnn_model, num_examples=6):
         img_np = (img_np * std + mean) * 255
         img_np = np.clip(img_np, 0, 255).astype(np.uint8)
         
-        pil_img = Image.fromarray(img_np)
+        pil_img = PILImage.fromarray(img_np)
         buffered = BytesIO()
         pil_img.save(buffered, format="JPEG")
         img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
@@ -545,47 +563,38 @@ def get_base64_examples(dataset, cnn_model, hqcnn_model, num_examples=6):
         
     return examples
 
+class BenchmarkTrainRequest(BaseModel):
+    dataset: str = "EuroSAT"
+
 @router.post("/benchmark/train")
-async def trigger_benchmark_training(current_user: dict = Depends(get_current_user)):
+async def trigger_benchmark_training(
+    req: BenchmarkTrainRequest = None,
+    current_user: dict = Depends(get_current_user)
+):
     try:
-        print("[PIPELINE START] Verify EuroSAT dataset path...")
-        dataset_path = os.path.join(config.BASE_DIR, "datasets", "images", "EuroSAT")
-        if not os.path.exists(dataset_path):
-            print(f"[PIPELINE ERROR] EuroSAT dataset path not found at: {dataset_path}")
-            return make_response(success=False, message="EuroSAT dataset not found.")
+        dataset_name = req.dataset if req else "EuroSAT"
+        print(f"[PIPELINE START] Verifying {dataset_name} dataset path...")
+        
+        dataset_path = DATASETS.get(dataset_name)
+        if not dataset_path or not os.path.exists(dataset_path):
+            print(f"[PIPELINE ERROR] {dataset_name} dataset path not found at: {dataset_path}")
+            return make_response(success=False, message=f"{dataset_name} dataset not found.")
             
         print("[PIPELINE START] Verifying dataset contents...")
-        # Check subdirectories and images instantly (Step 12 optimization)
         subdirs = [d for d in os.listdir(dataset_path) if os.path.isdir(os.path.join(dataset_path, d))]
         if len(subdirs) == 0:
-            print("[PIPELINE ERROR] EuroSAT dataset directory is empty!")
+            print(f"[PIPELINE ERROR] {dataset_name} dataset directory is empty!")
             return make_response(success=False, message="Dataset is empty.")
             
-        # Step 11: Check if trained models already exist
         print("[PIPELINE START] Checking for pre-trained models on disk...")
-        cnn_path = os.path.join(config.BASE_DIR, "models", "classical", "cnn_model.pth")
-        rf_path = os.path.join(config.BASE_DIR, "models", "classical", "random_forest.pkl")
-        svm_path = os.path.join(config.BASE_DIR, "models", "classical", "svm.pkl")
-        xgb_path = os.path.join(config.BASE_DIR, "models", "classical", "xgboost.pkl")
-        
-        qsvm_path = os.path.join(config.BASE_DIR, "models", "quantum", "qsvm.pkl")
-        vqc_path = os.path.join(config.BASE_DIR, "models", "quantum", "vqc.pkl")
-        hqcnn_path = os.path.join(config.BASE_DIR, "models", "quantum", "hybrid_qcnn.pth")
-        
-        models_exist = all(os.path.exists(p) for p in [
-            cnn_path, rf_path, svm_path, xgb_path,
-            qsvm_path, vqc_path, hqcnn_path
-        ])
-        
+        models_exist = check_dataset_models_exist(config.BASE_DIR, dataset_name)
         benchmarks_col = get_collection("benchmarks")
         
         if models_exist:
-            print("[PIPELINE CACHE] Pre-trained models found. Loading results from MongoDB...")
-            cached_summary = benchmarks_col.find_one({"model_name": "summary"})
+            print(f"[PIPELINE CACHE] Pre-trained models found for {dataset_name}. Loading results from MongoDB...")
+            cached_summary = benchmarks_col.find_one({"model_name": "summary", "dataset_name": dataset_name})
             if cached_summary:
                 serialized_summary = serialize_document(cached_summary)
-                
-                # Make sure the results dictionary exists
                 if "results" not in serialized_summary:
                     cl = serialized_summary.get("classical", {})
                     q = serialized_summary.get("quantum", {})
@@ -598,48 +607,55 @@ async def trigger_benchmark_training(current_user: dict = Depends(get_current_us
                     }
                 
                 reports_dir = os.path.join(config.BASE_DIR, "reports")
-                print(f"[PIPELINE CACHE] Automatically exporting plots and history to: {reports_dir}")
+                print(f"[PIPELINE CACHE] Exporting plots and history to: {reports_dir}")
                 save_benchmark_plots_and_reports(serialized_summary, reports_dir)
                 
-                print("[PIPELINE SUCCESS] Serving cached benchmark summary response.")
+                print("[PIPELINE SUCCESS] Serving cached benchmark summary.")
                 return make_response(data=serialized_summary)
 
         # 2. Train Classical models
-        print("[PIPELINE RUN] Starting Classical Training pipeline...")
-        classical = ClassicalPipeline(config.BASE_DIR)
-        class_results = classical.train_models("image", dataset_path)
+        print(f"[PIPELINE RUN] Starting Classical Training pipeline for {dataset_name}...")
+        classical = ClassicalPipeline(config.BASE_DIR, dataset_name=dataset_name)
+        class_results = classical.train_all_classical_models(dataset_name)
         print("[PIPELINE RUN] Classical Training completed.")
         
         # 3. Train Quantum models
-        print("[PIPELINE RUN] Starting Quantum Training pipeline...")
-        quantum = QuantumPipeline(config.BASE_DIR)
-        quant_results = quantum.train_all_quantum_models("image", dataset_path)
+        print(f"[PIPELINE RUN] Starting Quantum Training pipeline for {dataset_name}...")
+        quantum = QuantumPipeline(config.BASE_DIR, dataset_name=dataset_name)
+        quant_results = quantum.train_all_quantum_models(dataset_name)
         print("[PIPELINE RUN] Quantum Training completed.")
         
-        # 4. Extract total samples and class list from loader for examples and stats
-        train_loader, val_loader, test_loader, total_samples, num_classes, classes = load_image_dataset(dataset_path)
+        # 4. Load dataset loader details for metrics
+        from backend.datasets.loader import DatasetLoader
+        loader = DatasetLoader()
+        train_loader, val_loader, test_loader, total_samples, num_classes, classes = loader.load_dataset(dataset_name)
         
         # 5. Load models to generate base64 prediction examples
         print("[PIPELINE EVAL] Loading trained models for prediction previews...")
         cnn_model = SimpleCNN(num_classes=num_classes)
-        cnn_model.load_state_dict(torch.load(os.path.join(config.BASE_DIR, "models", "classical", "cnn_model.pth")))
+        cnn_path = os.path.join(config.BASE_DIR, "models", "classical", dataset_name.lower(), "cnn.pth")
+        if not os.path.exists(cnn_path):
+            cnn_path = os.path.join(config.BASE_DIR, "models", "classical", dataset_name.lower(), "cnn_model.pth")
+        cnn_model.load_state_dict(torch.load(cnn_path))
         
         hqcnn_model = HybridQuantumCNN(num_classes=num_classes)
+        hqcnn_path = os.path.join(config.BASE_DIR, "models", "quantum", dataset_name.lower(), "hybrid_qcnn.pth")
         try:
-            hqcnn_model.load_state_dict(torch.load(os.path.join(config.BASE_DIR, "models", "quantum", "hybrid_qcnn.pth")))
+            hqcnn_model.load_state_dict(torch.load(hqcnn_path))
         except Exception:
             hqcnn_model = None
             
         import torchvision.transforms as transforms
-        from torchvision.datasets import ImageFolder
         raw_transform = transforms.Compose([
             transforms.Resize((64, 64)),
             transforms.ToTensor()
         ])
+        
+        # Instantiate raw ImageFolder to select sample images
         raw_dataset = ImageFolder(root=dataset_path, transform=raw_transform)
         examples = get_base64_examples(raw_dataset, cnn_model, hqcnn_model, num_examples=6)
         
-        # 6. Save results in MongoDB benchmarks collection
+        # 6. Save results in MongoDB
         created_at = datetime.datetime.utcnow().isoformat()
         
         models_data = {
@@ -652,7 +668,7 @@ async def trigger_benchmark_training(current_user: dict = Depends(get_current_us
             "hybrid_qcnn": quant_results["hybrid_qcnn"]
         }
         
-        print("[MONGO SAVE] Inserting individual model training logs into MongoDB...")
+        print("[MONGO SAVE] Inserting individual model logs...")
         for model_name, metrics in models_data.items():
             train_time = metrics.get("training_time_s", metrics.get("training_time", 0.0))
             inf_time = metrics.get("inference_time_s", metrics.get("inference_time", 0.0))
@@ -668,7 +684,7 @@ async def trigger_benchmark_training(current_user: dict = Depends(get_current_us
                 "confusion_matrix": metrics["confusion_matrix"],
                 "roc_auc": roc_auc_val,
                 "model_name": model_name,
-                "dataset_name": "EuroSAT",
+                "dataset_name": dataset_name,
                 "created_at": created_at
             }
             benchmarks_col.insert_one(serialize_document(doc))
@@ -681,10 +697,9 @@ async def trigger_benchmark_training(current_user: dict = Depends(get_current_us
             "confusion_matrix": class_results["cnn"]["confusion_matrix"]
         }
         
-        # Create and save a summary document for frontend results query
         summary_doc = {
             "model_name": "summary",
-            "dataset_name": "EuroSAT",
+            "dataset_name": dataset_name,
             "created_at": created_at,
             "classical": class_results,
             "quantum": quant_results,
@@ -704,43 +719,32 @@ async def trigger_benchmark_training(current_user: dict = Depends(get_current_us
             "results": results_dict
         }
         
-        print("[MONGO SAVE] Inserting benchmark summary document into MongoDB...")
         benchmarks_col.insert_one(serialize_document(summary_doc))
         
-        # Step 12: Save reports
         reports_dir = os.path.join(config.BASE_DIR, "reports")
-        print(f"[REPORTS SAVE] Generating PDF, PNG charts, and TXT summaries in: {reports_dir}")
         save_benchmark_plots_and_reports(summary_doc, reports_dir)
         
-        print("[PIPELINE SUCCESS] Benchmark training completed. Returning JSON payload.")
         return make_response(data=serialize_document(summary_doc))
     except ValueError as val_err:
         print(f"[PIPELINE ERROR] Validation error: {val_err}")
-        import traceback
-        traceback.print_exc()
         logger.warning(f"Validation error during training: {val_err}")
         return make_response(success=False, message=str(val_err))
     except Exception as e:
         print(f"[PIPELINE ERROR] Unexpected failure: {e}")
-        import traceback
-        traceback.print_exc()
         logger.exception(e)
         return make_response(success=False, message=f"Internal error during training: {str(e)}")
 
 @router.get("/benchmark/results")
-async def get_latest_benchmarks(current_user: dict = Depends(get_current_user)):
+async def get_latest_benchmarks(
+    dataset: str = "EuroSAT",
+    current_user: dict = Depends(get_current_user)
+):
     try:
-        print("[DASHBOARD]")
-        print("Loading benchmark results...")
-        
         benchmarks_col = get_collection("benchmarks")
-        results = benchmarks_col.find({"model_name": "summary"})
+        results = benchmarks_col.find({"model_name": "summary", "dataset_name": dataset})
         results_list = list(results)
         
         if not results_list:
-            print("No benchmark found.")
-            print()
-            print("Waiting for user to start training.")
             return {
                 "success": True,
                 "trained": False,
@@ -760,7 +764,6 @@ async def get_latest_benchmarks(current_user: dict = Depends(get_current_user)):
 @router.get("/report/download/{file_id}")
 async def download_report_pdf(file_id: str):
     try:
-        # Fetch file record
         history_col = get_collection("uploads_history")
         record = history_col.find_one({"file_id": file_id})
         record = serialize_document(record)
@@ -780,11 +783,9 @@ async def download_report_pdf(file_id: str):
         pdf_filename = f"report_{file_id}.pdf"
         pdf_path = os.path.join(config.REPORTS_DIR, pdf_filename)
         
-        # Prepare comparison inputs for PDF
         classical_details = predictions["classical_details"]
         quantum_details = predictions["quantum_details"]["qsvm"]
         
-        # Format for PDF
         class_results_pdf = {
             "random_forest": {
                 "class_name": classical_details["random_forest"]["class_name"],
@@ -806,7 +807,6 @@ async def download_report_pdf(file_id: str):
             }
         }
         
-        # Generate PDF
         try:
             generate_crop_report(
                 pdf_path,
@@ -829,36 +829,27 @@ async def download_report_pdf(file_id: str):
         logger.exception(e)
         return make_response(success=False, message=str(e))
 
-def uuid_timestamp():
-    return datetime.datetime.utcnow().isoformat()
-
 @router.get("/model/status")
-async def check_model_status(current_user: dict = Depends(get_current_user)):
+async def check_model_status(
+    dataset: str = "EuroSAT",
+    current_user: dict = Depends(get_current_user)
+):
     try:
-        cnn_path = os.path.join(config.BASE_DIR, "models", "classical", "cnn_model.pth")
-        rf_path = os.path.join(config.BASE_DIR, "models", "classical", "random_forest.pkl")
-        svm_path = os.path.join(config.BASE_DIR, "models", "classical", "svm.pkl")
-        xgb_path = os.path.join(config.BASE_DIR, "models", "classical", "xgboost.pkl")
-        
-        qsvm_path = os.path.join(config.BASE_DIR, "models", "quantum", "qsvm.pkl")
-        vqc_path = os.path.join(config.BASE_DIR, "models", "quantum", "vqc.pkl")
-        hqcnn_path = os.path.join(config.BASE_DIR, "models", "quantum", "hybrid_qcnn.pth")
-        
-        trained = all(os.path.exists(p) for p in [
-            cnn_path, rf_path, svm_path, xgb_path,
-            qsvm_path, vqc_path, hqcnn_path
-        ])
+        trained = check_dataset_models_exist(config.BASE_DIR, dataset)
+        d_low = dataset.lower()
+        class_dir = os.path.join(config.BASE_DIR, "models", "classical", d_low)
+        quant_dir = os.path.join(config.BASE_DIR, "models", "quantum", d_low)
         
         return make_response(data={
             "trained": trained,
             "details": {
-                "cnn": os.path.exists(cnn_path),
-                "random_forest": os.path.exists(rf_path),
-                "svm": os.path.exists(svm_path),
-                "xgboost": os.path.exists(xgb_path),
-                "qsvm": os.path.exists(qsvm_path),
-                "vqc": os.path.exists(vqc_path),
-                "hybrid_qcnn": os.path.exists(hqcnn_path)
+                "cnn": os.path.exists(os.path.join(class_dir, "cnn.pth")) or os.path.exists(os.path.join(class_dir, "cnn_model.pth")),
+                "random_forest": os.path.exists(os.path.join(class_dir, "rf.pkl")) or os.path.exists(os.path.join(class_dir, "random_forest.pkl")) or os.path.exists(os.path.join(class_dir, "random_forest_model.pkl")),
+                "svm": os.path.exists(os.path.join(class_dir, "svm.pkl")) or os.path.exists(os.path.join(class_dir, "svm_model.pkl")),
+                "xgboost": os.path.exists(os.path.join(class_dir, "xgb.pkl")) or os.path.exists(os.path.join(class_dir, "xgboost.pkl")) or os.path.exists(os.path.join(class_dir, "xgboost_model.pkl")),
+                "qsvm": os.path.exists(os.path.join(quant_dir, "qsvm.pkl")) or os.path.exists(os.path.join(quant_dir, "qsvm_model.pkl")),
+                "vqc": os.path.exists(os.path.join(quant_dir, "vqc.pkl")),
+                "hybrid_qcnn": os.path.exists(os.path.join(quant_dir, "hybrid_qcnn.pth"))
             }
         })
     except Exception as e:
@@ -871,17 +862,14 @@ async def upload_prediction_image(
     current_user: dict = Depends(get_current_user)
 ):
     try:
-        # Validate allowed format
         allowed_exts = {".png", ".jpg", ".jpeg"}
         _, ext = os.path.splitext(file.filename.lower())
         if ext not in allowed_exts:
             return make_response(success=False, message="Unsupported image.")
             
-        # Ensure upload folder exists
         uploads_dir = os.path.join(config.BASE_DIR, "uploads")
         os.makedirs(uploads_dir, exist_ok=True)
         
-        # Save file to uploads folder
         file_id = str(uuid.uuid4())
         filename = f"upload_{file_id}{ext}"
         file_path = os.path.join(uploads_dir, filename)
@@ -889,73 +877,72 @@ async def upload_prediction_image(
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
             
-        # Check if models are trained
-        cnn_path = os.path.join(config.BASE_DIR, "models", "classical", "cnn_model.pth")
-        if not os.path.exists(cnn_path):
-            return make_response(success=False, message="Models not trained. Please train first.")
+        img = PILImage.open(file_path).convert("RGB")
+        width, height = img.size
+        
+        # STEP 7: Auto detect image type
+        detected_dataset = detect_uploaded_image_type(file.filename, width, height, len(img.getbands()))
+        
+        if not check_dataset_models_exist(config.BASE_DIR, detected_dataset):
+            return make_response(success=False, message=f"Models not trained for {detected_dataset}. Please train first.")
             
-        # Preprocess and predict
-        dataset_path = os.path.join(config.BASE_DIR, "datasets", "images", "EuroSAT")
-        if not os.path.exists(dataset_path):
-            return make_response(success=False, message="EuroSAT dataset not found.")
-            
-        # Detect classes
-        from torchvision.datasets import ImageFolder
-        raw_dataset = ImageFolder(root=dataset_path)
-        classes = raw_dataset.classes
+        # Load classes dynamically
+        le_path = os.path.join(config.BASE_DIR, "models", "classical", detected_dataset.lower(), "label_encoder.pkl")
+        if os.path.exists(le_path):
+            with open(le_path, "rb") as f:
+                le = pickle.load(f)
+            classes = list(le.classes_)
+        else:
+            classes = ["Class " + str(i) for i in range(10)]
         num_classes = len(classes)
         
         # Load SimpleCNN model
+        cnn_path = os.path.join(config.BASE_DIR, "models", "classical", detected_dataset.lower(), "cnn.pth")
+        if not os.path.exists(cnn_path):
+            cnn_path = os.path.join(config.BASE_DIR, "models", "classical", detected_dataset.lower(), "cnn_model.pth")
+            
         cnn_model = SimpleCNN(num_classes=num_classes)
         cnn_model.load_state_dict(torch.load(cnn_path))
         cnn_model.eval()
         
-        # Open and transform image
         import torchvision.transforms as transforms
-        from PIL import Image
-        
         transform = transforms.Compose([
             transforms.Resize((64, 64)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
         
-        img = Image.open(file_path).convert("RGB")
-        img_tensor = transform(img).unsqueeze(0) # Batch dimension
+        img_tensor = transform(img).unsqueeze(0)
         
-        # Run prediction
         start_time = time.time()
         with torch.no_grad():
             outputs = cnn_model(img_tensor)
             probs = torch.softmax(outputs, dim=1).squeeze(0).numpy()
             
-        pred_time = (time.time() - start_time) * 1000 # in ms
+        pred_time = (time.time() - start_time) * 1000
         
         pred_idx = int(np.argmax(probs))
         predicted_crop_type = classes[pred_idx]
         confidence = float(probs[pred_idx])
         
-        # Get Top 5 Predictions
         top_5_indices = np.argsort(probs)[::-1][:5]
         top_5_predictions = [
-            {"class": classes[idx], "probability": float(probs[idx])}
+            {"class": classes[idx] if idx < len(classes) else "Unknown", "probability": float(probs[idx])}
             for idx in top_5_indices
         ]
         
-        # Generate GradCAM Heatmap
         heatmap = None
         try:
             img_tensor_grad = img_tensor.clone().detach().requires_grad_(True)
             heatmap_np = generate_gradcam(cnn_model, img_tensor_grad, pred_idx, img)
             if heatmap_np is not None:
-                pil_heatmap = Image.fromarray(heatmap_np)
+                pil_heatmap = PILImage.fromarray(heatmap_np)
                 buffered = BytesIO()
                 pil_heatmap.save(buffered, format="PNG")
                 heatmap = f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode('utf-8')}"
         except Exception as e:
             logger.error(f"GradCAM generation failed: {e}")
             
-        # Return complete prediction response JSON
         return make_response(data={
             "predicted_crop_type": predicted_crop_type,
             "confidence": confidence,
@@ -963,13 +950,13 @@ async def upload_prediction_image(
             "top_5_predictions": top_5_predictions,
             "prediction_time": pred_time,
             "gradcam_heatmap": heatmap,
-            "uploaded_image": f"/uploads/{filename}" # static URL path
+            "uploaded_image": f"/uploads/{filename}"
         })
     except Exception as e:
         logger.exception(e)
         return make_response(success=False, message="Unsupported image.")
 
-# Alias for upload endpoint under predictions router
+# Alias for upload endpoint
 from backend.api.processing import upload_and_process_image
 
 @router.post("/upload")
@@ -978,6 +965,3 @@ async def upload_image_predictions_alias(
     current_user: dict = Depends(get_current_user)
 ):
     return await upload_and_process_image(file=file, current_user=current_user)
-
-
-

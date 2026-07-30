@@ -169,6 +169,13 @@ async def startup_event():
     else:
         print("Models Loaded (None)")
         
+    # 4. Check Earth Engine Connection Status
+    from backend.services.gee_service import gee_connected, gee_project
+    if gee_connected:
+        print(f"✓ Earth Engine Connected (Project: {gee_project})")
+    else:
+        print("✗ Earth Engine unavailable")
+        
     print("FastAPI Ready")
     print(f"Listening on port {port}")
 
@@ -183,10 +190,11 @@ async def run_vqc_test():
         sys.stdout = buffer = io.StringIO()
         
         try:
-            qp = QuantumPipeline(config.BASE_DIR)
-            dataset_path = os.path.join(config.BASE_DIR, "datasets", "images", "EuroSAT")
+            qp = QuantumPipeline(config.BASE_DIR, dataset_name="EuroSAT")
+            from backend.config.datasets import DATASETS
+            dataset_path = DATASETS.get("EuroSAT")
             print(f"Loading data from: {dataset_path}")
-            X_train, X_test, y_train, y_test, _, _, num_classes = qp.load_and_reduce_data(dataset_path)
+            X_train, X_test, y_train, y_test, _, _, num_classes = qp.load_and_reduce_data("EuroSAT")
             res = qp.train_vqc(X_train, X_test, y_train, y_test, num_classes=num_classes)
             print("VQC Training completed successfully! Result:", res)
             success = True

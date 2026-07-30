@@ -151,3 +151,28 @@ def get_collection(collection_name):
         return db[collection_name]
     else:
         return db.get_collection(collection_name)
+
+def serialize_document(doc):
+    if not doc:
+        return None
+    from bson import ObjectId
+    import numpy as np
+    
+    def serialize_value(val):
+        if isinstance(val, ObjectId):
+            return str(val)
+        elif isinstance(val, (np.float32, np.float64)):
+            return float(val)
+        elif isinstance(val, (np.int32, np.int64)):
+            return int(val)
+        elif isinstance(val, np.ndarray):
+            return [serialize_value(item) for item in val.tolist()]
+        elif isinstance(val, dict):
+            return {k: serialize_value(v) for k, v in val.items()}
+        elif isinstance(val, list):
+            return [serialize_value(item) for item in val]
+        return val
+
+    if isinstance(doc, dict):
+        return {k: serialize_value(v) for k, v in doc.items()}
+    return serialize_value(doc)

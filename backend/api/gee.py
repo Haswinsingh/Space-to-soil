@@ -17,6 +17,14 @@ logger = logging.getLogger("uvicorn.error")
 
 router = APIRouter(prefix="/gee", tags=["Google Earth Engine"])
 
+def check_gee_available():
+    from backend.services.gee_service import gee_connected, gee_error_reason
+    if not gee_connected:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Google Earth Engine is disabled or unavailable: {gee_error_reason or 'Authentication failed'}"
+        )
+
 class AnalyzeRequest(BaseModel):
     latitude: float
     longitude: float
@@ -24,8 +32,24 @@ class AnalyzeRequest(BaseModel):
     geojson: Optional[Dict[str, Any]] = None
     use_landsat: Optional[bool] = False
 
+@router.get("/status")
+async def get_gee_status():
+    """Returns the current connection status of Google Earth Engine."""
+    from backend.services.gee_service import gee_connected, gee_project, gee_error_reason
+    if gee_connected:
+        return {
+            "connected": True,
+            "project": gee_project or "Default project"
+        }
+    else:
+        return {
+            "connected": False,
+            "reason": gee_error_reason or "Authentication failed"
+        }
+
 @router.get("/map")
 async def get_gee_map(lat: float, lng: float, use_landsat: bool = False):
+    check_gee_available()
     try:
         result = analyze_field(lat, lng, use_landsat=use_landsat)
         return {"success": True, "tile_urls": result["tile_urls"]}
@@ -35,6 +59,7 @@ async def get_gee_map(lat: float, lng: float, use_landsat: bool = False):
 
 @router.get("/ndvi")
 async def get_gee_ndvi(lat: float, lng: float, use_landsat: bool = False):
+    check_gee_available()
     try:
         result = analyze_field(lat, lng, use_landsat=use_landsat)
         return {"success": True, "ndvi_url": result["tile_urls"]["ndvi"]}
@@ -44,6 +69,7 @@ async def get_gee_ndvi(lat: float, lng: float, use_landsat: bool = False):
 
 @router.get("/evi")
 async def get_gee_evi(lat: float, lng: float, use_landsat: bool = False):
+    check_gee_available()
     try:
         result = analyze_field(lat, lng, use_landsat=use_landsat)
         return {"success": True, "evi_url": result["tile_urls"]["evi"]}
@@ -53,6 +79,7 @@ async def get_gee_evi(lat: float, lng: float, use_landsat: bool = False):
 
 @router.get("/savi")
 async def get_gee_savi(lat: float, lng: float, use_landsat: bool = False):
+    check_gee_available()
     try:
         result = analyze_field(lat, lng, use_landsat=use_landsat)
         return {"success": True, "savi_url": result["tile_urls"]["savi"]}
@@ -62,6 +89,7 @@ async def get_gee_savi(lat: float, lng: float, use_landsat: bool = False):
 
 @router.get("/ndwi")
 async def get_gee_ndwi(lat: float, lng: float, use_landsat: bool = False):
+    check_gee_available()
     try:
         result = analyze_field(lat, lng, use_landsat=use_landsat)
         return {"success": True, "ndwi_url": result["tile_urls"]["ndwi"]}
@@ -71,6 +99,7 @@ async def get_gee_ndwi(lat: float, lng: float, use_landsat: bool = False):
 
 @router.post("/analyze")
 async def post_gee_analyze(req: AnalyzeRequest, current_user: dict = Depends(get_current_user)):
+    check_gee_available()
     try:
         # Determine polygon coords
         coords = None
@@ -88,16 +117,16 @@ async def post_gee_analyze(req: AnalyzeRequest, current_user: dict = Depends(get
         features = gee_res["features"]
         raw_path = gee_res["image_path"]
 
-        # Run Classical & Quantum predictions (Task 14 / 15)
+        # Run Classical & Quantum predictions on Sentinel2 dataset (default routing dataset for GEE)
         try:
-            classical = ClassicalPipeline(config.BASE_DIR)
+            classical = ClassicalPipeline(config.BASE_DIR, dataset_name="Sentinel2")
             classical_res = classical.predict(features, image_path=raw_path)
         except Exception as clf_err:
             logger.exception(clf_err)
             raise HTTPException(status_code=500, detail=f"Classical prediction model error: {str(clf_err)}")
 
         try:
-            quantum = QuantumPipeline(config.BASE_DIR)
+            quantum = QuantumPipeline(config.BASE_DIR, dataset_name="Sentinel2")
             quantum_res = quantum.predict(features, image_path=raw_path)
         except Exception as q_err:
             logger.exception(q_err)
@@ -119,7 +148,7 @@ async def post_gee_analyze(req: AnalyzeRequest, current_user: dict = Depends(get
         ndwi_mean = features.get("ndwi_mean", 0.0)
         ci_mean = features.get("ci_mean", 3.0)
 
-        # Generate Recommendations (Task 15)
+        # Generate Recommendations
         recommendations = []
 
         # Rule 1: NDVI Vegetation Density
@@ -217,7 +246,7 @@ async def post_gee_analyze(req: AnalyzeRequest, current_user: dict = Depends(get
                 "message": "Crop shows high vegetation reflection and moisture. Maintain current irrigation and fertilizer schedules."
             })
 
-        # Logging (Task 21)
+        # Logging
         print("\n=== GOOGLE EARTH ENGINE PREDICTION COMPLETED ===")
         print(f"NDVI Mean: {ndvi_mean:.4f}")
         print(f"EVI Mean: {evi_mean:.4f}")
@@ -252,7 +281,7 @@ async def post_gee_analyze(req: AnalyzeRequest, current_user: dict = Depends(get
             "paths": {
                 "raw": raw_url,
                 "processed": {
-                    "ndvi": raw_url, # Fallback to true-color download if processed not locally computed
+                    "ndvi": raw_url,
                     "evi": raw_url,
                     "savi": raw_url,
                     "ndwi": raw_url,

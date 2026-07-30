@@ -1,0 +1,47 @@
+Success: False
+Error: cannot access local variable 'tqdm' where it is not associated with a value
+
+Logs:
+[DATASET LOADING] Detected original image size for PlantVillage: 256x256
+[DEV MODE] Subsetting training dataset to 20.0% and validation to 10%...
+[DATALOADER CONFIG] Mode: development | Batch Size: 64 | num_workers: 0 | pin_memory: False | persistent_workers: False
+[DATASET LOADING] Detected 16 classes: ['Pepper__bell___Bacterial_spot', 'Pepper__bell___healthy', 'PlantVillage', 'Potato___Early_blight', 'Potato___Late_blight', 'Potato___healthy', 'Tomato_Bacterial_spot', 'Tomato_Early_blight', 'Tomato_Late_blight', 'Tomato_Leaf_Mold', 'Tomato_Septoria_leaf_spot', 'Tomato_Spider_mites_Two_spotted_spider_mite', 'Tomato__Target_Spot', 'Tomato__Tomato_YellowLeaf__Curl_Virus', 'Tomato__Tomato_mosaic_virus', 'Tomato_healthy']
+[DATASET SPLIT] Split configurations: Train=6604, Val=412, Test=4127
+[CLASSICAL DEV] Running training and evaluation on device: cpu
+[TRAINING] Retraining Classical Pipeline for PlantVillage...
+[TRAINING CLASSICAL] Starting training for SimpleCNN | Epochs: 2 | Batches: 104
+Epoch 1/2 | Batch 10/104 | Loss: 1.8497 | Accuracy: 47.34% | ETA: 51s | Images/sec: 116.7
+Epoch 1/2 | Batch 20/104 | Loss: 1.9972 | Accuracy: 49.69% | ETA: 50s | Images/sec: 106.2
+Epoch 1/2 | Batch 30/104 | Loss: 1.9753 | Accuracy: 48.59% | ETA: 43s | Images/sec: 107.7
+Epoch 1/2 | Batch 40/104 | Loss: 2.1191 | Accuracy: 48.52% | ETA: 37s | Images/sec: 110.4
+Epoch 1/2 | Batch 50/104 | Loss: 1.9816 | Accuracy: 48.06% | ETA: 32s | Images/sec: 106.7
+Epoch 1/2 | Batch 60/104 | Loss: 1.7575 | Accuracy: 48.49% | ETA: 27s | Images/sec: 104.3
+Epoch 1/2 | Batch 70/104 | Loss: 1.7302 | Accuracy: 48.93% | ETA: 20s | Images/sec: 108.1
+Epoch 1/2 | Batch 80/104 | Loss: 1.6504 | Accuracy: 49.30% | ETA: 14s | Images/sec: 109.5
+Epoch 1/2 | Batch 90/104 | Loss: 1.6001 | Accuracy: 49.90% | ETA: 7s | Images/sec: 112.7
+Epoch 1/2 | Batch 100/104 | Loss: 1.7533 | Accuracy: 50.08% | ETA: 2s | Images/sec: 115.1
+Epoch 1/2 | Batch 104/104 | Loss: 1.8462 | Accuracy: 49.98% | ETA: 0s | Images/sec: 115.9
+[CLASSICAL CNN] Completed Epoch 1/2 | Training Loss: 1.8814 | Training Accuracy: 49.98%
+[CHECKPOINT] Saved SimpleCNN checkpoint at: D:\space to soil\backend\models\classical\plantvillage\cnn_epoch_1.pth
+Epoch 2/2 | Batch 10/104 | Loss: 1.4834 | Accuracy: 52.50% | ETA: 13s | Images/sec: 440.0
+Epoch 2/2 | Batch 20/104 | Loss: 1.5614 | Accuracy: 50.94% | ETA: 12s | Images/sec: 446.1
+Epoch 2/2 | Batch 30/104 | Loss: 1.5071 | Accuracy: 50.05% | ETA: 10s | Images/sec: 444.7
+Epoch 2/2 | Batch 40/104 | Loss: 1.6521 | Accuracy: 50.59% | ETA: 9s | Images/sec: 440.3
+Epoch 2/2 | Batch 50/104 | Loss: 1.6602 | Accuracy: 49.81% | ETA: 7s | Images/sec: 439.5
+Epoch 2/2 | Batch 60/104 | Loss: 1.7682 | Accuracy: 49.77% | ETA: 6s | Images/sec: 414.8
+Epoch 2/2 | Batch 70/104 | Loss: 1.4880 | Accuracy: 49.84% | ETA: 5s | Images/sec: 410.1
+Epoch 2/2 | Batch 80/104 | Loss: 1.8355 | Accuracy: 49.82% | ETA: 3s | Images/sec: 411.0
+Epoch 2/2 | Batch 90/104 | Loss: 1.8251 | Accuracy: 49.98% | ETA: 2s | Images/sec: 413.6
+Epoch 2/2 | Batch 100/104 | Loss: 1.6114 | Accuracy: 49.58% | ETA: 0s | Images/sec: 415.2
+Epoch 2/2 | Batch 104/104 | Loss: 1.2094 | Accuracy: 49.70% | ETA: 0s | Images/sec: 415.3
+[CLASSICAL CNN] Completed Epoch 2/2 | Training Loss: 1.5934 | Training Accuracy: 49.70%
+[CHECKPOINT] Saved SimpleCNN checkpoint at: D:\space to soil\backend\models\classical\plantvillage\cnn_epoch_2.pth
+[TRAINING CLASSICAL] CNN training finished in 72.89s.
+[VALIDATION CLASSICAL] Evaluating CNN...
+
+!!! [VALIDATION ERROR OCCURRED] !!!
+[VALIDATION ERROR LOCATION] File: D:\space to soil\backend\models\classical\classifiers.py, Line: 590, Function: _train_image_pipeline_internal
+Exact line of code: for imgs, targets in tqdm(test_loader, desc="Validating CNN"):
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+Classical Training failed with error: cannot access local variable 'tqdm' where it is not associated with a value

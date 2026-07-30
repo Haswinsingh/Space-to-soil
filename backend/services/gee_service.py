@@ -3,56 +3,161 @@ import json
 import logging
 import datetime
 import requests
-import ee
-from google.oauth2.credentials import Credentials
 
 logger = logging.getLogger("uvicorn.error")
+
+try:
+    import ee
+    from google.oauth2.credentials import Credentials
+    HAS_EE = True
+except ImportError:
+    HAS_EE = False
+    logger.warning("earthengine-api or google-auth package is not installed.")
 
 # Caching dictionary to prevent repeatedly fetching the same coordinates/image
 _gee_cache = {}
 
-def initialize_gee():
-    try:
-        # Try default credentials/project first
-        ee.Initialize()
-        logger.info("Connected to Earth Engine (Default credentials)")
-        print("Connected to Earth Engine (Default credentials)")
-        return True
-    except Exception as e:
-        logger.warning(f"Default Earth Engine connection failed: {e}. Attempting manual path.")
-        try:
-            creds_path = os.path.expanduser("~/.config/earthengine/credentials")
-            if os.path.exists(creds_path):
-                with open(creds_path, "r") as f:
-                    creds_data = json.load(f)
-                creds = Credentials(
-                    token=None,
-                    refresh_token=creds_data["refresh_token"],
-                    client_id=creds_data["client_id"],
-                    client_secret=creds_data["client_secret"],
-                    token_uri="https://oauth2.googleapis.com/token",
-                    scopes=creds_data["scopes"]
-                )
-                project = creds_data.get("project")
-                ee.Initialize(credentials=creds, project=project)
-                logger.info(f"Connected to Earth Engine (Manual project: {project})")
-                print(f"Connected to Earth Engine (Manual project: {project})")
-                return True
-            else:
-                logger.error("No Earth Engine credentials file found.")
-                return False
-        except Exception as manual_err:
-            logger.exception(f"Manual Earth Engine connection failed: {manual_err}")
-            return False
+# Global status variables
+gee_connected = False
+gee_project = None
+gee_credentials_path = None
+gee_error_reason = None
 
-# Initialize on import
-initialize_gee()
+def initialize_gee():
+    global gee_connected, gee_project, gee_credentials_path, gee_error_reason
+    
+    if not HAS_EE:
+        gee_connected = False
+        gee_error_reason = "earthengine-api or google-auth package is not installed"
+        print("✗ Earth Engine Authentication Failed")
+        print(f"Project: {gee_project}")
+        print(f"Credentials path: {gee_credentials_path}")
+        print(f"Reason: {gee_error_reason}")
+        print("Earth Engine unavailable")
+        logger.error("✗ Earth Engine Authentication Failed")
+        logger.warning("Earth Engine unavailable")
+        return False
+
+    # Retrieve project ID dynamically from env, credentials file, or fallback
+    project_id = os.getenv("EARTHENGINE_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT")
+    
+    # Try reading project from credentials file if not in env
+    creds_path = os.path.expanduser("~/.config/earthengine/credentials")
+    gee_credentials_path = creds_path
+    if not project_id and os.path.exists(creds_path):
+        try:
+            with open(creds_path, "r") as f:
+                creds_data = json.load(f)
+            project_id = creds_data.get("project")
+        except Exception:
+            pass
+            
+    # Final fallback project ID
+    if not project_id:
+        project_id = "ee-haswinpiranavesh"
+
+    # 1. Try default Initialize first, specifying the project ID
+    try:
+        ee.Initialize(project=project_id)
+        gee_connected = True
+        gee_error_reason = None
+        gee_project = project_id
+        print("✓ Earth Engine Connected")
+        logger.info(f"✓ Earth Engine Connected (Project: {gee_project})")
+        return True
+    except Exception as default_err:
+        logger.warning(f"Default Earth Engine initialization failed: {default_err}. Attempting automatic authentication.")
+        
+        # 2. Try ee.Authenticate() followed by ee.Initialize()
+        try:
+            ee.Authenticate()
+            ee.Initialize(project=project_id)
+            gee_connected = True
+            gee_error_reason = None
+            gee_project = project_id
+            print("✓ Earth Engine Connected after Authenticate")
+            logger.info(f"✓ Earth Engine Connected after Authenticate (Project: {gee_project})")
+            return True
+        except Exception as auth_err:
+            logger.warning(f"Automatic authentication failed: {auth_err}. Attempting manual path credentials.")
+            
+            # 3. Try manual credential path configuration
+            try:
+                if os.path.exists(creds_path):
+                    with open(creds_path, "r") as f:
+                        creds_data = json.load(f)
+                    
+                    # Retrieve properties safely without KeyError
+                    refresh_token = creds_data.get("refresh_token")
+                    client_id = creds_data.get("client_id")
+                    client_secret = creds_data.get("client_secret")
+                    scopes = creds_data.get("scopes")
+                    
+                    # If client_id is missing, try using built-in ee client ID if possible
+                    if not client_id:
+                        try:
+                            import ee.oauth
+                            client_id = ee.oauth.CLIENT_ID
+                            client_secret = ee.oauth.CLIENT_SECRET
+                        except Exception:
+                            pass
+                            
+                    creds = Credentials(
+                        token=None,
+                        refresh_token=refresh_token,
+                        client_id=client_id,
+                        client_secret=client_secret,
+                        token_uri="https://oauth2.googleapis.com/token",
+                        scopes=scopes
+                    )
+                    project = creds_data.get("project") or project_id
+                    ee.Initialize(credentials=creds, project=project)
+                    gee_connected = True
+                    gee_project = project
+                    gee_error_reason = None
+                    print("✓ Earth Engine Connected")
+                    logger.info(f"✓ Earth Engine Connected (Manual credentials, Project: {gee_project})")
+                    return True
+                else:
+                    raise FileNotFoundError(f"Earth Engine credentials file not found at {creds_path}")
+            except Exception as final_err:
+                gee_connected = False
+                gee_error_reason = str(final_err)
+                gee_project = project_id
+                
+                # Output exactly as requested by Task 5
+                print("✗ Earth Engine Authentication Failed")
+                print(f"Project: {gee_project}")
+                print(f"Credentials path: {gee_credentials_path}")
+                print(f"Reason: {gee_error_reason}")
+                print("Earth Engine unavailable")
+                
+                logger.error("✗ Earth Engine Authentication Failed")
+                logger.error(f"Project: {gee_project} | Credentials path: {gee_credentials_path} | Reason: {gee_error_reason}")
+                logger.warning("Earth Engine unavailable")
+                return False
+
+# Initialize on import safely without raising any exceptions
+try:
+    initialize_gee()
+except Exception as startup_err:
+    gee_connected = False
+    gee_error_reason = str(startup_err)
+    print("✗ Earth Engine Authentication Failed")
+    print(f"Project: None")
+    print(f"Credentials path: None")
+    print(f"Reason: {startup_err}")
+    print("Earth Engine unavailable")
+    logger.error("✗ Earth Engine Authentication Failed during startup import hook")
+    logger.warning("Earth Engine unavailable")
 
 def analyze_field(latitude: float, longitude: float, polygon_coords: list = None, use_landsat: bool = False):
     """
     Queries Sentinel-2 (or Landsat-8) for a given coordinate/polygon, computes indices,
     calculates stats, generates map tile URLs, and downloads a thumbnail image for ML.
     """
+    if not gee_connected:
+        raise ValueError("Google Earth Engine is disabled or unavailable due to authentication failure.")
     # Create GEE Geometry
     if polygon_coords:
         # Expected polygon format: list of [lng, lat]

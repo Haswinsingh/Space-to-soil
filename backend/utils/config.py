@@ -34,3 +34,9 @@ os.makedirs(MODEL_PATH, exist_ok=True)
 # Pre-generate subfolders for requested image dataset types
 for dataset_subfolder in ["EuroSAT", "PlantVillage", "RadiantEarth", "Sentinel2"]:
     os.makedirs(os.path.join(DATASET_IMAGE_PATH, dataset_subfolder), exist_ok=True)
+
+# Training Modes & Optimizations (Task 8 Requirements)
+TRAIN_MODE = os.getenv("TRAIN_MODE", "development")  # "development" or "production"
+DATASET_PERCENTAGE = float(os.getenv("DATASET_PERCENTAGE", "0.2"))  # Dev mode default 20%
+EPOCHS = int(os.getenv("EPOCHS", "2"))                              # Dev mode default 2 epochs
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "64"))                    # Dev mode default 64 batch size

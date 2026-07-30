@@ -50,32 +50,36 @@ const ModelBenchmarking: React.FC = () => {
   const { token } = useAuth();
   
   const [loading, setLoading] = useState(false);
+  const [selectedDataset, setSelectedDataset] = useState<string>('EuroSAT');
   const [benchmarkData, setBenchmarkData] = useState<any>(null);
   const [activeCircuitTab, setActiveCircuitTab] = useState<'qsvm' | 'vqc'>('qsvm');
   const [selectedCMModel, setSelectedCMModel] = useState<string>('cnn');
 
-  // Fetch benchmark results on load
+  // Fetch benchmark results on load or dataset change
   useEffect(() => {
     const fetchBenchmarks = async () => {
       try {
-        const res = await api.get('/predictions/benchmark/results', {
+        const res = await api.get(`/predictions/benchmark/results?dataset=${selectedDataset}`, {
           headers: { 'Authorization': `Bearer ${token}` }
         });
-        if (res.data && res.data.success) {
+        if (res.data && res.data.success && res.data.trained) {
           setBenchmarkData(res.data.data);
+        } else {
+          setBenchmarkData(null);
         }
       } catch (err) {
         console.error("Error fetching benchmarks", err);
+        setBenchmarkData(null);
       }
     };
     fetchBenchmarks();
-  }, [token]);
+  }, [token, selectedDataset]);
 
   // Train and evaluate benchmark models on demand
   const handleTrainBenchmarks = async () => {
     setLoading(true);
     try {
-      const res = await api.post('/predictions/benchmark/train', {}, {
+      const res = await api.post('/predictions/benchmark/train', { dataset: selectedDataset }, {
         headers: { 'Authorization': `Bearer ${token}` }
       });
       if (res.data && res.data.success) {
@@ -220,7 +224,6 @@ const ModelBenchmarking: React.FC = () => {
     const cnn_roc = benchmarkData.classical.cnn.roc_curve;
     const qcnn_roc = benchmarkData.quantum.hybrid_qcnn.roc_curve;
     
-    // Sort coordinates by FPR for proper line plotting
     const cnn_points = (cnn_roc.fpr || []).map((f: number, i: number) => ({ x: f, y: cnn_roc.tpr[i] }));
     const qcnn_points = (qcnn_roc.fpr || []).map((f: number, i: number) => ({ x: f, y: qcnn_roc.tpr[i] }));
 
@@ -273,10 +276,7 @@ const ModelBenchmarking: React.FC = () => {
 
   const getCMClasses = () => {
     if (!benchmarkData) return [];
-    return benchmarkData.classical.cnn.classes || [
-      'AnnualCrop', 'Forest', 'HerbaceousVeg', 'Highway', 'Industrial',
-      'Pasture', 'PermanentCrop', 'Residential', 'River', 'SeaLake'
-    ];
+    return benchmarkData.classical.cnn.classes || [];
   };
 
   return (
@@ -285,21 +285,35 @@ const ModelBenchmarking: React.FC = () => {
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
         <div>
           <h2 className="text-3xl font-extrabold font-sans text-slate-100">Quantum Benchmarking Dashboard</h2>
-          <p className="text-dark-muted text-xs">Compare QML kernels and Hybrid networks against state-of-the-art classical classifier architectures on EuroSAT RGB dataset</p>
+          <p className="text-dark-muted text-xs">Compare QML kernels and Hybrid networks against state-of-the-art classical classifier architectures</p>
         </div>
         
-        <button
-          onClick={handleTrainBenchmarks}
-          disabled={loading}
-          className="px-5 py-2.5 rounded-lg bg-gradient-to-r from-quantum-cyan to-quantum-blue text-[#040814] font-bold shadow-quantum-glow hover:opacity-90 transition-all flex items-center gap-2 text-xs disabled:opacity-50"
-        >
-          {loading ? (
-            <span className="w-4 h-4 rounded-full border-2 border-[#040814] border-t-transparent animate-spin" />
-          ) : (
-            <Play size={14} className="fill-current" />
-          )}
-          <span>{loading ? "Training Pipeline..." : "Train & Benchmark Models"}</span>
-        </button>
+        <div className="flex items-center gap-3 w-full md:w-auto">
+          {/* STEP 6: Dataset Selector Dropdown */}
+          <select
+            value={selectedDataset}
+            onChange={(e) => setSelectedDataset(e.target.value)}
+            disabled={loading}
+            className="px-3.5 py-2.5 rounded-lg bg-slate-900 border border-dark-border text-slate-200 font-bold focus:outline-none focus:border-quantum-cyan transition-colors text-xs cursor-pointer shadow-inner"
+          >
+            <option value="EuroSAT" className="bg-slate-950 text-slate-200">EuroSAT (Land Cover)</option>
+            <option value="PlantVillage" className="bg-slate-950 text-slate-200">PlantVillage (Crop Diseases)</option>
+            <option value="Sentinel2" className="bg-slate-950 text-slate-200">Sentinel2 (Agricultural Monitoring)</option>
+          </select>
+
+          <button
+            onClick={handleTrainBenchmarks}
+            disabled={loading}
+            className="px-5 py-2.5 rounded-lg bg-gradient-to-r from-quantum-cyan to-quantum-blue text-[#040814] font-bold shadow-quantum-glow hover:opacity-90 transition-all flex items-center gap-2 text-xs disabled:opacity-50 whitespace-nowrap"
+          >
+            {loading ? (
+              <span className="w-4 h-4 rounded-full border-2 border-[#040814] border-t-transparent animate-spin" />
+            ) : (
+              <Play size={14} className="fill-current" />
+            )}
+            <span>{loading ? "Training Pipeline..." : "Train & Benchmark"}</span>
+          </button>
+        </div>
       </div>
 
       {/* Dataset Statistics Overview Card */}
@@ -311,7 +325,7 @@ const ModelBenchmarking: React.FC = () => {
             </div>
             <div>
               <p className="text-[10px] text-dark-muted uppercase font-bold tracking-wider">Dataset Type</p>
-              <p className="text-sm font-bold text-slate-200">EuroSAT RGB Dataset</p>
+              <p className="text-sm font-bold text-slate-200">{selectedDataset} RGB Dataset</p>
             </div>
           </div>
 
@@ -356,7 +370,7 @@ const ModelBenchmarking: React.FC = () => {
             <div className="glass-panel p-6 rounded-xl space-y-4">
               <div>
                 <h3 className="font-bold text-slate-200 text-sm">Classification Model F1-Scores</h3>
-                <p className="text-[10px] text-dark-muted">Weighted F1 score benchmark across all 10 land cover classes</p>
+                <p className="text-[10px] text-dark-muted">Weighted F1 score benchmark across all {benchmarkData.class_count} classes</p>
               </div>
               <div className="h-[260px] flex items-center justify-center">
                 <Bar 
@@ -534,12 +548,18 @@ const ModelBenchmarking: React.FC = () => {
                 </select>
               </div>
 
-              {getSelectedConfusionMatrix() ? (
+              {getSelectedConfusionMatrix() && getCMClasses().length > 0 ? (
                 <div className="overflow-x-auto">
-                  <div className="min-w-[600px] space-y-2">
+                  <div 
+                    className="space-y-2"
+                    style={{ minWidth: `${Math.max(600, getCMClasses().length * 60)}px` }}
+                  >
                     {/* Header Row */}
-                    <div className="grid grid-cols-11 text-center font-bold text-[9px] text-dark-muted">
-                      <div className="col-span-1 text-left truncate">True \ Pred</div>
+                    <div 
+                      className="grid text-center font-bold text-[9px] text-dark-muted"
+                      style={{ gridTemplateColumns: `repeat(${getCMClasses().length + 1}, minmax(0, 1fr))` }}
+                    >
+                      <div className="text-left truncate">True \ Pred</div>
                       {getCMClasses().map((cls, idx) => (
                         <div key={idx} className="truncate px-0.5">{cls.replace('HerbaceousVegetation', 'HerbVeg')}</div>
                       ))}
@@ -548,14 +568,16 @@ const ModelBenchmarking: React.FC = () => {
                     {getSelectedConfusionMatrix().map((row: number[], rIdx: number) => {
                       const rowSum = row.reduce((a, b) => a + b, 0);
                       return (
-                        <div key={rIdx} className="grid grid-cols-11 text-center items-center text-xs h-9">
-                          <div className="col-span-1 text-left font-bold text-[9px] text-slate-300 truncate pr-1">
-                            {getCMClasses()[rIdx].replace('HerbaceousVegetation', 'HerbVeg')}
+                        <div 
+                          key={rIdx} 
+                          className="grid text-center items-center text-xs h-9"
+                          style={{ gridTemplateColumns: `repeat(${getCMClasses().length + 1}, minmax(0, 1fr))` }}
+                        >
+                          <div className="text-left font-bold text-[9px] text-slate-300 truncate pr-1">
+                            {getCMClasses()[rIdx]?.replace('HerbaceousVegetation', 'HerbVeg') || `C${rIdx}`}
                           </div>
                           {row.map((val, cIdx) => {
                             const pct = rowSum > 0 ? val / rowSum : 0;
-                            // Generate background color class dynamically
-                            const intensity = Math.round(pct * 100);
                             const cellBg = pct > 0.0
                               ? `rgba(0, 242, 254, ${Math.max(0.1, pct)})`
                               : 'transparent';
@@ -582,10 +604,10 @@ const ModelBenchmarking: React.FC = () => {
               )}
             </div>
 
-            {/* Prediction Examples (Real EuroSAT Thumbnails) */}
+            {/* Prediction Examples */}
             <div className="glass-panel p-6 rounded-xl space-y-4">
               <div>
-                <h3 className="font-bold text-slate-200 text-sm">Prediction Examples (EuroSAT Test Set)</h3>
+                <h3 className="font-bold text-slate-200 text-sm">Prediction Examples ({selectedDataset} Test Set)</h3>
                 <p className="text-[10px] text-dark-muted">Real images evaluated side-by-side using classical CNN vs. Hybrid Quantum CNN</p>
               </div>
 
@@ -597,7 +619,7 @@ const ModelBenchmarking: React.FC = () => {
                     return (
                       <div key={idx} className="bg-slate-950/60 border border-dark-border rounded-xl p-4 space-y-3 relative overflow-hidden">
                         <div className="w-full aspect-square rounded-lg overflow-hidden border border-white/5 flex items-center justify-center bg-slate-900">
-                          <img src={item.image} alt="Satelitte land cover example" className="w-full h-full object-cover" />
+                          <img src={item.image} alt="Evaluation example" className="w-full h-full object-cover" />
                         </div>
                         <div className="space-y-1">
                           <p className="text-[9px] text-dark-muted uppercase font-bold tracking-wider">True Category</p>
@@ -661,7 +683,7 @@ const ModelBenchmarking: React.FC = () => {
 
           </div>
 
-          {/* Side Performance Table (Detailed Metrics Dashboard) */}
+          {/* Side Performance Table */}
           <div className="glass-panel p-6 rounded-xl flex flex-col justify-between border border-dark-border">
             <div className="space-y-6">
               <div className="flex items-center gap-2 border-b border-dark-border pb-3">
@@ -714,11 +736,11 @@ const ModelBenchmarking: React.FC = () => {
           <Cpu size={48} className="mb-4 text-dark-muted/40 animate-pulse" />
           <h4 className="font-bold text-base text-slate-300">Models not trained yet. Click 'Initialize Training Run'.</h4>
           <p className="text-xs text-dark-muted max-w-sm mt-1.5 mb-6">
-            Train classifiers on the real EuroSAT RGB land-cover database to compare performance metrics and compile quantum circuits.
+            Train classifiers on the real {selectedDataset} RGB database to compare performance metrics and compile quantum circuits.
           </p>
           <button 
             onClick={handleTrainBenchmarks}
-            className="px-5 py-2.5 rounded-lg bg-gradient-to-r from-quantum-cyan to-quantum-blue text-[#040814] font-bold"
+            className="px-5 py-2.5 rounded-lg bg-gradient-to-r from-quantum-cyan to-quantum-blue text-[#040814] font-bold shadow-quantum-glow hover:opacity-90 transition-all text-xs"
           >
             Initialize Training Run
           </button>
