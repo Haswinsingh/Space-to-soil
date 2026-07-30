@@ -1,8 +1,8 @@
 import logging
+import bcrypt
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from typing import Optional
 from pydantic import BaseModel, EmailStr
@@ -13,7 +13,6 @@ from backend.utils.mongo import serialize_document, make_response
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 logger = logging.getLogger("AuthAPI")
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/token")
 
 # Pydantic schemas
@@ -41,10 +40,18 @@ def get_user(email: str):
     return serialize_document(doc)
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    pwd_bytes = password.encode('utf-8')[:72]
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(pwd_bytes, salt).decode('utf-8')
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    try:
+        pwd_bytes = plain_password.encode('utf-8')[:72]
+        hash_bytes = hashed_password.encode('utf-8')
+        return bcrypt.checkpw(pwd_bytes, hash_bytes)
+    except Exception as e:
+        logger.error(f"Password verification error: {e}")
+        return False
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
@@ -76,12 +83,12 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     return user
 
 # Routes
-@router.post("/register", response_model=dict)
+@router.post("/register", response_model=dict, status_code=status.HTTP_201_CREATED)
 async def register(user_data: UserRegister):
     try:
         existing_user = get_user(user_data.email)
         if existing_user:
-            raise HTTPException(status_code=400, detail="Email already registered")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
             
         hashed_pwd = hash_password(user_data.password)
         users_col = get_collection("users")
@@ -90,7 +97,7 @@ async def register(user_data: UserRegister):
             "username": user_data.username,
             "email": user_data.email,
             "hashed_password": hashed_pwd,
-            "created_at": datetime.utcnow()
+            "created_at": datetime.utcnow().isoformat()
         }
         users_col.insert_one(serialize_document(new_user))
         
@@ -104,8 +111,9 @@ async def register(user_data: UserRegister):
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception(e)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception(f"Unhandled error during registration for {user_data.email}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Registration failed: {str(e)}")
+
 
 @router.post("/login", response_model=dict)
 async def login(user_data: UserLogin):

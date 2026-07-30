@@ -4,6 +4,7 @@ import logging
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 from backend.utils import config
+from backend.utils.mongo import serialize_document, serialize_documents
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Database")

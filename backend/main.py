@@ -121,7 +121,27 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
+# Global Exception Handler to ensure full tracebacks are logged for unhandled exceptions
+from fastapi import Request
+from fastapi.responses import JSONResponse
+import logging
+
+logger = logging.getLogger("uvicorn.error")
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.exception(f"Unhandled server exception on {request.method} {request.url.path}: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "message": "An unexpected server error occurred.",
+            "detail": str(exc)
+        }
+    )
+
 # Configure CORS for local development & production
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
